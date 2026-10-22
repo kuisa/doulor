@@ -52,6 +52,17 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # 401/403 触发重登的冷却秒数：防止上游持续拒绝时每个请求都打登录接口
 AUTH_RELOGIN_COOLDOWN = 30
 
+# 上游故障重试：上游的 400/502 是间歇性的（同一 body 重发即可成功），
+# 实测 400 "至少需要一条用户消息" 会在合法请求上偶发出现，502
+# "可用渠道不存在" 更是常态。这类不该让客户端一次失败就断掉。
+RETRY_BACKOFF = (2, 5, 10)       # 每次重试前等待的秒数
+
+# 上游硬限制：单次请求 role=="tool" 的消息条数上限 29（30 条起返回
+# 400 INVALID_MESSAGES，文案却写"至少需要一条用户消息"，极具误导性）。
+# 实测 62 条消息的阈值本质就是 tool 条数，纯 user/assistant 对话可到 150+
+# 无问题。超出时由 compact_tool_history 折叠较早的往返。
+MAX_TOOL_MSGS = int(os.getenv("DOULOR_MAX_TOOL_MSGS", "29"))
+
 # 只暴露这一个模型（已实测免费可用）。
 # 上游 /api/lab/models 里还列着一堆收费模型，调用会返回
 # 502 "Failed to get available channel for model ..."，所以不暴露。
@@ -63,7 +74,8 @@ MODELS = [{"id": MODEL_ID, "object": "model", "owned_by": "doulor"}]
 def log(msg):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
-    print(line, flush=True)
+    # 只写文件，不 print：systemd 的 StandardOutput=append 已把 stdout
+    # 指向同一个 proxy.log，再 print 会让每行出现两次。
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -240,14 +252,20 @@ def upstream_chat(body, sid, timeout=180):
     return r.status, r.headers, r
 
 
-def parse_sse(raw_lines):
-    """把上游 SSE 行流解析成 OpenAI 格式的 chunk 字典（逐个 yield）"""
+def parse_sse(raw_lines, state=None):
+    """把上游 SSE 行流解析成 OpenAI 格式的 chunk 字典（逐个 yield）
+
+    state 是可选 dict：见到 [DONE] 时置 state["done"]=True，供调用方
+    判断这条流是真结束还是上游提前关闭连接（后者不抛异常，看不出来）。
+    """
     for line in raw_lines:
         s = line.decode("utf-8", "replace").strip()
         if not s or not s.startswith("data:"):
             continue
         payload = s[5:].strip()
         if payload == "[DONE]":
+            if state is not None:
+                state["done"] = True
             break
         try:
             chunk = json.loads(payload)
@@ -296,6 +314,37 @@ def _normalize_error(detail):
 # ---------------------------------------------------------------- HTTP 服务
 
 def read_body(handler):
+    """读请求体，同时支持 Content-Length 和 Transfer-Encoding: chunked。
+
+    只认 Content-Length 时，客户端用 chunked 发大 payload（openai SDK 超过
+    一定体积会自动切换）会读到空 body，上游收到 {} 直接回 400
+    INVALID_MESSAGES，看起来像是客户端发错了消息。
+    """
+    te = (handler.headers.get("Transfer-Encoding") or "").lower()
+    if "chunked" in te:
+        chunks = []
+        while True:
+            line = handler.rfile.readline(65536)
+            if not line:
+                break
+            size_s = line.strip().split(b";")[0].strip()
+            if not size_s:
+                continue
+            try:
+                size = int(size_s, 16)
+            except ValueError:
+                break
+            if size == 0:
+                # 吞掉 trailer 直到空行
+                while True:
+                    t = handler.rfile.readline(65536)
+                    if t in (b"\r\n", b"\n", b""):
+                        break
+                break
+            chunks.append(handler.rfile.read(size))
+            handler.rfile.read(2)  # 每块尾随的 CRLF
+        return b"".join(chunks)
+
     n = int(handler.headers.get("Content-Length") or 0)
     return handler.rfile.read(n) if n else b""
 
@@ -311,13 +360,132 @@ def json_response(handler, code, obj, extra_headers=None):
     handler.wfile.write(data)
 
 
+def _is_retryable_code(code):
+    """上游哪些状态码值得重发。
+
+    401/403 走重登分支，由调用方单独处理，不在这里判。
+    400 也算：上游拿它兜底"至少需要一条用户消息"，实测对合法 body
+    偶发返回，重发即可成功。真·非法请求被拒得很快，重试成本可忽略。
+    """
+    return code == 400 or code == 429 or 500 <= code <= 599
+
+
+def compact_tool_history(msgs, max_tool_msgs=MAX_TOOL_MSGS):
+    """把超量的历史 tool 往返折叠成文本摘要。
+
+    上游硬限制：单次请求里 role=="tool" 的消息条数超过 29 直接 400
+    INVALID_MESSAGES（报错文案是"至少需要一条用户消息"，与实情无关）。
+
+    折叠以"轮"为单位：一条带 tool_calls 的 assistant 加上它名下全部
+    tool 回应是不可分割的整体。按单条 tool 消息回溯配对会让并行
+    tool_call（一轮多个 tool）产生孤儿消息，实测会这样。
+    """
+    tool_idx = [i for i, m in enumerate(msgs) if m.get("role") == "tool"]
+    if len(tool_idx) <= max_tool_msgs:
+        return msgs, 0
+
+    # 划分"轮"：assistant(tool_calls) 起头，吞掉紧随其后、id 在它名下的
+    # tool 消息；id 不匹配的 tool 消息单独成轮，交给下面按条数兜底。
+    rounds, i, n = [], 0, len(msgs)
+    while i < n:
+        m = msgs[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            ids = {tc.get("id") for tc in m["tool_calls"]}
+            idxs = [i]
+            j = i + 1
+            while j < n and msgs[j].get("role") == "tool" and msgs[j].get("tool_call_id") in ids:
+                idxs.append(j)
+                j += 1
+            rounds.append(idxs)
+            i = j
+        elif m.get("role") == "tool":
+            rounds.append([i])
+            i += 1
+        else:
+            i += 1
+
+    # 从最老的轮开始丢，直到剩余 tool 消息不超上限
+    keep_from = 0
+    total = sum(1 for x in msgs if x.get("role") == "tool")
+    for k, idxs in enumerate(rounds):
+        if total <= max_tool_msgs:
+            keep_from = k
+            break
+        cnt = sum(1 for x in idxs if msgs[x].get("role") == "tool")
+        total -= cnt
+        keep_from = k + 1
+
+    dropped = rounds[:keep_from]
+    skip = {x for idxs in dropped for x in idxs}
+    if not skip:
+        return msgs, 0
+
+    names = []
+    for idxs in dropped:
+        for x in idxs:
+            for tc in (msgs[x].get("tool_calls") or []):
+                names.append(((tc.get("function") or {}).get("name")) or "?")
+
+    out, first_removed = [], None
+    for i, m in enumerate(msgs):
+        if i in skip:
+            if first_removed is None:
+                first_removed = len(out)
+            continue
+        out.append(m)
+
+    uniq = sorted(set(names))
+    note = (f"[历史压缩] 为满足上游单次请求的 tool 消息上限，"
+            f"已折叠较早的 {len(dropped)} 轮工具调用"
+            f"（涉及工具：{', '.join(uniq[:8]) or '无'}）。"
+            f"这些调用的结果不再逐条可见；如需重新确认，请再次调用相应工具。")
+    out.insert(min(first_removed, len(out)), {"role": "system", "content": note})
+
+    return out, len(dropped)
+
+
 def handle_chat(handler, body):
-    """核心：转发到上游，遇 401/403 自动重登重试一次"""
+    """核心：转发到上游，401/403 重登重试，400/429/5xx 退避重试"""
     want_stream = bool(body.get("stream"))
     body.setdefault("model", MODELS[0]["id"])
     body.pop("stream", None) if not want_stream else None
 
-    for attempt in (1, 2):
+    # 诊断：记录 messages 的角色序列和每条内容长度。
+    # 上游要求至少一条非空 user 消息，否则 400 INVALID_MESSAGES。
+    msgs = body.get("messages") or []
+    msgs, folded = compact_tool_history(msgs)
+    if folded:
+        body["messages"] = msgs
+        log(f"✂️ 折叠了 {folded} 轮旧工具调用（tool 消息上限 {MAX_TOOL_MSGS}）"
+            f"，折叠后 msgs={len(msgs)}")
+    roles = "/".join(str(m.get("role")) for m in msgs)
+    lens = ",".join(str(len(str(m.get("content") or ""))) for m in msgs)
+    log(f"📨 msgs={len(msgs)} roles=[{roles[:300]}] lens=[{lens[:300]}]"
+        f" stream={want_stream} tools={len(body.get('tools') or [])}")
+    # 上游 400 INVALID_MESSAGES 时最需要原始结构，落一份便于复盘。
+    if os.environ.get("DOULOR_DUMP_BODY"):
+        try:
+            with open(os.path.join(STATE_DIR, "last_body.json"), "w", encoding="utf-8") as f:
+                json.dump(body, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    retries = 0          # 故障重试已用次数
+    auth_retried = False  # 鉴权重试只给一次，和故障重试分开计
+
+    def backoff(reason):
+        """按剩余额度退避等待；返回 True 表示调用方可以 continue 重试。
+        额度用尽返回 False，由调用方把错误回给客户端。"""
+        nonlocal retries
+        if retries >= len(RETRY_BACKOFF):
+            return False
+        wait = RETRY_BACKOFF[retries]
+        retries += 1
+        log(f"🔁 {wait}s 后重试（{retries}/{len(RETRY_BACKOFF)}），原因 {reason}")
+        time.sleep(wait)
+        return True
+
+    while True:
         sid = SESSION.get()
         if not sid:
             json_response(handler, 502, {"error": {"message": "无法登录上游",
@@ -328,7 +496,8 @@ def handle_chat(handler, body):
             status, hdrs, resp = upstream_chat(body, sid)
         except urllib.error.HTTPError as e:
             code = e.code
-            if code in (401, 403) and attempt == 1:
+            if code in (401, 403) and not auth_retried:
+                auth_retried = True
                 log(f"⚠️ 上游 {code}，尝试重新登录后重试")
                 # 不要先 invalidate：清掉 sid 会让冷却期内的后续请求
                 # 走 get() 重新登录，等于绕过冷却。重登成功会覆盖 sid，
@@ -341,11 +510,24 @@ def handle_chat(handler, body):
                     continue
                 log(f"⏸ 重登被冷却/失败拦住，直接返回 {code}")
             detail = e.read().decode("utf-8", "replace")[:500]
+            try:
+                e.close()
+            except Exception:
+                pass
             log(f"❌ 上游 HTTP {code}: {detail[:200]}")
+
+            # 间歇性故障：退避后重发同一个 body。此时还没给客户端写过
+            # 任何字节（流式也一样），所以重试是安全的。
+            if _is_retryable_code(code) and backoff(code):
+                continue
+
             json_response(handler, code, {"error": _normalize_error(detail)})
             return
         except Exception as e:
             log(f"❌ 上游异常: {type(e).__name__}: {e}")
+            # 连接层的抖动（超时、连接重置）同样按故障重试
+            if backoff(type(e).__name__):
+                continue
             json_response(handler, 502, {"error": {"message": str(e),
                                                  "type": "upstream_error"}})
             return
@@ -360,49 +542,112 @@ def handle_chat(handler, body):
             handler.send_header("Cache-Control", "no-cache")
             handler.send_header("Connection", "close")
             handler.end_headers()
-            try:
-                for chunk in parse_sse(resp):
-                    out = {
-                        "id": chunk.get("id", "chatcmpl-proxy"),
-                        "object": "chat.completion.chunk",
-                        "created": chunk.get("created", int(time.time())),
-                        "model": body.get("model"),
-                        "choices": chunk.get("choices", []),
-                    }
-                    handler.wfile.write(
-                        f"data: {json.dumps(out, ensure_ascii=False)}\n\n".encode())
-                    handler.wfile.flush()
-                handler.wfile.write(b"data: [DONE]\n\n")
-                handler.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            except Exception as e:
-                log(f"⚠️ 流式回传中断: {type(e).__name__}: {e}")
-                # 上游中途断开：补一个 error 事件 + [DONE]，
-                # 否则客户端会以为拿到的是完整回答。
+            # 尾块的标识：截断发生在任意位置，都要能补出一个形态合法的收尾块。
+            chunk_id, created = "chatcmpl-proxy", int(time.time())
+
+            # 读上游和写客户端要分开 try：两者的 IOError 类型相同（尤其
+            # ConnectionResetError），合在一个 except 里就分不清是谁断的。
+            # 旧代码把上游断连一起 pass 掉，收尾块压根没发出去——客户端于是
+            # 把半截回答当成了完整回答。
+            client_gone = False
+
+            def emit(obj):
+                # 客户端已断开就不必再写，让上层停下来
+                nonlocal client_gone
+                if client_gone:
+                    return
                 try:
-                    err = {"error": {"message": f"上游流中断: {type(e).__name__}",
-                                     "type": "upstream_stream_error"}}
                     handler.wfile.write(
-                        f"data: {json.dumps(err, ensure_ascii=False)}\n\n".encode())
-                    handler.wfile.write(b"data: [DONE]\n\n")
+                        f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
                     handler.wfile.flush()
-                except Exception:
-                    pass
+                except (BrokenPipeError, ConnectionResetError):
+                    client_gone = True
+
+            def finish_chunk(reason):
+                return {"id": chunk_id, "object": "chat.completion.chunk",
+                        "created": created, "model": body.get("model"),
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]}
+
+            st = {}
+            upstream_ok = False
+            try:
+                try:
+                    for chunk in parse_sse(resp, st):
+                        chunk_id = chunk.get("id", chunk_id)
+                        created = chunk.get("created", created)
+                        choices = chunk.get("choices") or []
+                        if any(c.get("finish_reason") for c in choices):
+                            st["finish"] = True
+                        emit({"id": chunk_id, "object": "chat.completion.chunk",
+                              "created": created, "model": body.get("model"),
+                              "choices": choices})
+                        if client_gone:
+                            break
+                    upstream_ok = True
+                except OSError as e:
+                    # 读上游时断连：urllib 可能抛 IncompleteRead / ConnectionResetError
+                    # 等各种 OSError，一律当作上游截断，走下面的 length 收尾。
+                    log(f"⚠️ 读上游中断: {type(e).__name__}: {e}")
             finally:
                 resp.close()
+
+            if client_gone:
+                return
+
+            # 上游没给 [DONE] 就关了连接（也不抛异常）：这是截断，
+            # 不能当成正常结束，否则客户端会把半截回答当完整的。
+            # 例外：已经发过 finish_reason 说明上游自己认账了，只是少个 [DONE]，
+            # 那是正常完成，别降级成截断（否则客户端会白续写一轮）。
+            truncated = not st.get("done") and not st.get("finish")
+            if not st.get("finish") and not truncated:
+                # [DONE] 到了却没有 finish_reason：补一个 stop，
+                # 别让客户端收到一个永远缺收尾块的流。
+                emit(finish_chunk("stop"))
+
+            if truncated:
+                # 上游中途断开：用 finish_reason="length" 收尾，而不是 error 事件。
+                # error 事件会被 openai SDK 解析成 APIError 抛出，能否保住已收到的
+                # 正文取决于客户端；"length" 是纯协议内的信号，客户端按截断处理，
+                # 既保留正文又能触发续写。参数被切断时客户端还能靠"不以 } 结尾"
+                # 识别出工具调用不完整，从而拒绝执行。
+                if not upstream_ok:
+                    log("⚠️ 上游流异常中断，补 finish_reason=length")
+                else:
+                    log("⚠️ 上游流未以 [DONE] 结束，补 finish_reason=length")
+                emit(finish_chunk("length"))
+
+            if not client_gone:
+                try:
+                    handler.wfile.write(b"data: [DONE]\n\n")
+                    handler.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             return
 
         # 非流式：收完再一次性返回
         try:
-            chunks = list(parse_sse(resp))
+            st = {}
+            chunks = list(parse_sse(resp, st))
         finally:
             resp.close()
+        # 还没给客户端写过任何字节，截断可以直接退避重发
+        if not st.get("done"):
+            log("⚠️ 非流式上游流被截断（无 [DONE]）")
+            if backoff("stream_truncated"):
+                continue
+            json_response(handler, 502, {"error": {
+                "message": "上游流被截断", "type": "upstream_stream_truncated"}})
+            return
         text = collect_text(chunks)
         usage = None
+        finish = None
         for c in chunks:
             if c.get("usage"):
                 usage = c["usage"]
+            # 取最后一个非空的 finish_reason（上游可能多次给出）
+            for ch in (c.get("choices") or []):
+                if ch.get("finish_reason"):
+                    finish = ch["finish_reason"]
         result = {
             "id": chunks[0].get("id", "chatcmpl-proxy") if chunks else "chatcmpl-proxy",
             "object": "chat.completion",
@@ -411,12 +656,15 @@ def handle_chat(handler, body):
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                # 透传上游的 finish_reason（length/tool_calls 等），
+                # 硬编码 stop 会让客户端把截断的回答当完整回答。
+                "finish_reason": finish or "stop",
             }],
         }
         if usage:
             result["usage"] = usage
         json_response(handler, 200, result)
+        return
 
 
 class Handler(__import__("http.server", fromlist=["BaseHTTPRequestHandler"]).BaseHTTPRequestHandler):

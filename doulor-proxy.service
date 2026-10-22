@@ -1,0 +1,17 @@
+[Unit]
+Description=doulor.cloud AI 中转服务
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/doulor-proxy
+ExecStart=/usr/bin/python3 /opt/doulor-proxy/proxy.py
+Restart=always
+RestartSec=5
+EnvironmentFile=-/opt/doulor-proxy/env
+StandardOutput=append:/opt/doulor-proxy/proxy.log
+StandardError=append:/opt/doulor-proxy/proxy.log
+
+[Install]
+WantedBy=multi-user.target

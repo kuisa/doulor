@@ -1,0 +1,10 @@
+[Unit]
+Description=每 5 分钟检查并修复 doulor 网关令牌分组
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=doulor 网关令牌分组自愈（修复 auto groups 502）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/doulor-proxy
+ExecStart=/usr/bin/python3 /opt/doulor-proxy/autofix.py
