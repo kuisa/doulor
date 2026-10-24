@@ -25,6 +25,8 @@ STATE_DIR = os.getenv("DOULOR_STATE_DIR", "/opt/doulor-proxy")
 COOKIE_FILE = os.path.join(STATE_DIR, "session.json")
 LOG_FILE = os.path.join(STATE_DIR, "checkin.log")
 ENV_FILE = os.path.join(STATE_DIR, "env")
+# 本次签到结果缓存：面板只读它，绝不再向上游查询，避免触发风控
+RESULT_FILE = os.path.join(STATE_DIR, "checkin_result.json")
 
 
 def load_env_file():
@@ -96,6 +98,48 @@ def fallback_login():
     return None
 
 
+def fetch_points(sid):
+    """读上游 /api/points，返回余额与签到流水汇总。失败返回 {}。"""
+    try:
+        req = urllib.request.Request(
+            BASE + "/api/points",
+            headers={"Cookie": f"doulor_session={sid}", "User-Agent": UA,
+                     "Accept": "application/json", "Referer": POINTS_PAGE})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return {}
+    tx = d.get("transactions") or []
+    ck = [t for t in tx if t.get("reason") == "checkin"]
+    return {
+        "balance": d.get("balance"),
+        "yuanPerPoint": (d.get("config") or {}).get("yuanPerPoint"),
+        "checkin_total": sum(int(t.get("delta") or 0) for t in ck),
+        "checkin_count": len(ck),
+        "checkin_recent": [{"at": t.get("createdAt"), "delta": t.get("delta"),
+                            "detail": t.get("detail") or ""} for t in ck[:10]],
+    }
+
+
+def balance_text(p):
+    if not p or p.get("balance") is None:
+        return "（未能取到余额）"
+    return f"{p['balance']} 分" + (f"（1 分抵 {p['yuanPerPoint']} 元）"
+                                  if p.get("yuanPerPoint") else "")
+
+
+def save_result(d):
+    """把本次签到结果落盘，供面板读取（面板不再打上游，避免风控）。"""
+    d = dict(d, at=time.time(), date=local_date())
+    try:
+        tmp = RESULT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, RESULT_FILE)
+    except Exception as e:
+        log(f"⚠️ 写入签到结果缓存失败: {type(e).__name__}: {e}")
+
+
 def request(sid, method="GET"):
     req = urllib.request.Request(
         CHECKIN_URL, method=method,
@@ -147,12 +191,20 @@ def main():
         log(f"⚠️ 日期不一致：服务端 today={today}，本地 UTC+8={exp}（以服务端为准）")
 
     if st.get("checkedIn"):
+        pts = fetch_points(sid)          # 唯一一次 /api/points
         log(f"✅ 今天已签到，无需操作（today={today} streak={st.get('streak')} "
-            f"本次得 {st.get('todayPoints')} 分）")
+            f"本次得 +{st.get('todayPoints')} 分）")
+        log(f"💰 账户余额 {balance_text(pts)}")
+        save_result({"ok": True, "already": True, "today": today,
+                     "streak": st.get("streak"),
+                     "todayPoints": st.get("todayPoints"),
+                     "next": st.get("next"), **pts})
         return 0
 
     if st.get("enabled") is False:
         log("ℹ️ 上游签到功能当前未开放，跳过")
+        save_result({"ok": True, "skipped": True, "reason": "upstream_disabled",
+                     "today": today})
         return 0
 
     # 2) 执行签到
@@ -167,14 +219,21 @@ def main():
         pts = (res or {}).get("total") if isinstance(res, dict) else None
         bonus = (res or {}).get("milestoneHit") if isinstance(res, dict) else None
         extra = f"（里程碑额外 +{bonus.get('points')}）" if isinstance(bonus, dict) else ""
-        log(f"🎉 签到成功，当前积分 {pts}{extra}")
+        got = fetch_points(sid)          # 唯一一次 /api/points
+        log(f"🎉 签到成功，本次获得 +{pts} 分{extra}")
+        log(f"💰 账户余额 {balance_text(got)}")
+        save_result({"ok": True, "already": False, "today": today,
+                     "points": pts, "milestone": bonus, **got})
         return 0
 
     if code == 409 or (isinstance(res, dict) and res.get("code") == "ALREADY_CHECKED_IN"):
         log("✅ 今天已经签过到了（并发/已签），视为成功")
+        got = fetch_points(sid)
+        save_result({"ok": True, "already": True, "today": today, **got})
         return 0
 
     log(f"❌ 签到失败 HTTP {code}: {res}")
+    save_result({"ok": False, "today": today, "error": f"HTTP {code}: {res}"})
     return 1
 
 

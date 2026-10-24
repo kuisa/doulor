@@ -67,12 +67,21 @@ case "$1" in
           sed -i "s|^DOULOR_PASS=.*|DOULOR_PASS=$p|" "$ENV_FILE"
       fi
       cp -f "$HERE/proxy.py" "$DIR/proxy.py" 2>/dev/null || true
+      cp -f "$HERE/checkin.py" "$DIR/checkin.py" 2>/dev/null || true
+      cp -f "$HERE/autofix.py" "$DIR/autofix.py" 2>/dev/null || true
       cp -f "$HERE/d.sh" "$DIR/d.sh" 2>/dev/null || true
       chmod +x "$DIR/d.sh" 2>/dev/null || true
+      # 每日自动签到 cron
+      if [ -f "$HERE/doulor-checkin.cron" ]; then
+          sed "s|__DIR__|$DIR|g" "$HERE/doulor-checkin.cron" > /etc/cron.d/doulor-checkin
+          chmod 644 /etc/cron.d/doulor-checkin
+      fi
       systemctl enable $SVC >/dev/null 2>&1
       systemctl restart $SVC
       sleep 3
       echo "✅ 安装完成"
+      echo "   API:  http://127.0.0.1:$PORT/v1"
+      echo "   面板: http://127.0.0.1:$PORT/  (初始密码 admin123)"
       "$HERE/d.sh" status
       ;;
   start)   sync; systemctl enable $SVC >/dev/null 2>&1; systemctl restart $SVC; echo "✅ 已启动" ;;
@@ -109,6 +118,7 @@ case "$1" in
       systemctl stop $SVC 2>/dev/null || true
       systemctl disable $SVC 2>/dev/null || true
       rm -f /etc/systemd/system/$SVC.service
+      rm -f /etc/cron.d/doulor-checkin
       systemctl daemon-reload
       echo "✅ 已卸载（env 和 cookie 保留在 $DIR）" ;;
   *) echo "用法: $0 {install|start|stop|restart|status|key <k>|pass|test|log|uninstall}" ;;

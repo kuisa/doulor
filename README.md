@@ -1,76 +1,86 @@
-# doulor-proxy
+# doular
 
-doulor.cloud（cloud.doulor.cn）AI 实验室反代：把站点的 `/api/lab/chat`
-包装成 **OpenAI 兼容 API**，自带登录态管理与签到积分。
+doulor.cloud AI 实验室反代：OpenAI 兼容 API + Web 管理面板。
+
+免费（lab）通道不可用时自动切到 api.doulor.cn/v1 直连通道（需要自建令牌，扣账号额度），恢复后自动切回。
 
 ```
-OpenAI 客户端 ──► proxy.py :8003 ──► cloud.doulor.cn /api/lab/chat
-                          （doulor_session cookie 自动续期）
+OpenAI 客户端 ──► :8003 /v1 ──► cloud.doulor.cn（免费 lab 通道）
+                            └─► api.doulor.cn /v1（备用，扣额度）
 ```
 
-## 文件
-
-| 文件 | 作用 |
-|---|---|
-| `proxy.py` | 主服务：OpenAI 兼容端点（`/v1/chat/completions`、`/v1/models`、`/healthz`），SSE↔非流式自动转换，cookie 持久化 + 过期自动重登 |
-| `checkin.py` | 每日自动签到（复用 proxy 的 cookie，失效自动重登写回），日志 `checkin.log` |
-| `autofix.py` | 令牌分组自愈：站点托管 key 的 group 会被同步成 `auto` → 全部请求 502（`auto groups is not enabled`）。此脚本登录网关 API 把 group 改回空（继承 `donation` 分组），由 timer 每 5 分钟跑一次 |
-| `d.sh` | 一键管理：`install / start / stop / restart / status / key <k> / pass / test / log / uninstall` |
-| `doulor-proxy.service` | 主服务 systemd unit |
-| `doulor-token-autofix.service` + `.timer` | 自愈脚本 unit + 每 5 分钟定时器 |
-| `env`（不入库） | `DOULOR_USER / DOULOR_PASS / DOULOR_API_KEY / DOULOR_LISTEN_HOST / DOULOR_LISTEN_PORT / DOULOR_STATE_DIR / DOULOR_BASE` |
-
-## 安装
+## 一键部署
 
 ```sh
-sudo ./d.sh install     # 交互输入 doulor 账号密码
+git clone https://github.com/kuisa/doular.git
+cd doular
+sudo ./d.sh install
 ```
 
-`install` 会：生成 `env`（chmod 600）→ 写入 `/etc/systemd/system/doulor-proxy.service` → enable + restart。
+按提示输入你的 doulor 账号、密码，装完即用。
 
-自愈定时器（可选但强烈建议）：
+## 使用
+
+任意 OpenAI 兼容客户端填：
+
+- **Base URL**: `http://你的IP:8003/v1`
+- **API Key**: `d.sh key <你的key>` 设置的值（不设则不校验）
+- **模型**: `workbuddy-deepseek-v4.1-flash` / `workbuddy-glm-5.3-flash` 等，`/v1/models` 可查
+
+测试：
+
+```sh
+sudo ./d.sh test
+```
+
+## Web 面板
+
+浏览器打开 `http://127.0.0.1:8003/`（或你的服务器 IP）：
+
+- token 计数 / 请求统计 / 请求日志
+- 每日签到（cron 每天 00:10 自动签，面板显示最近一次结果与积分）
+- doulor 账号密码在线修改（保存后自动重新登录）
+- 面板访问密码在线修改（初始 `admin123`，在 env 里设 `DOULOR_PANEL_PASS` 也可以）
+
+## 环境变量
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `DOULOR_USER` | ✅ | doulor 账号（邮箱/用户名） |
+| `DOULOR_PASS` | ✅ | doulor 密码 |
+| `DOULOR_API_KEY` |  | /v1 接口鉴权 key，留空不校验 |
+| `DOULOR_PANEL_PASS` |  | 面板初始访问密码，默认 `admin123` |
+| `DOULOR_LISTEN_HOST` |  | 监听地址，默认 `127.0.0.1`（对外用改 `0.0.0.0` + 防火墙） |
+| `DOULOR_LISTEN_PORT` |  | 监听端口，默认 `8003` |
+
+全部支持 `cp env.example env` 后填入（d.sh install 也会交互生成）。
+
+## 管理命令
+
+```sh
+sudo ./d.sh {install|start|stop|restart|status|key <k>|pass|test|log|uninstall}
+```
+
+## 备用 v1 通道（可选）
+
+lab 免费通道故障期间会自动切 api.doulor.cn/v1，需要你预先在 api.doulor.cn 建一个令牌，写入 `v1_token.json`：
+
+```json
+{"key": "sk-你的令牌"}
+```
+
+没有这个文件也能跑，只是切备用通道时会报「v1 通道未配置 key」。
+
+## 需求
+
+- Linux + systemd（Debian/Ubuntu 测试通过）
+- Python 3.9+（仅标准库，无第三方依赖）
+- cron（每日签到用）
+
+自愈定时器（可选但建议）：
 
 ```sh
 sudo cp doulor-token-autofix.service doulor-token-autofix.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now doulor-token-autofix.timer
 ```
-
-## 使用
-
-```sh
-curl http://127.0.0.1:8003/v1/chat/completions \
-  -H "Authorization: Bearer $DOULOR_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"workbuddy-deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}'
-```
-
-任意 OpenAI 兼容客户端填：
-
-- **Base URL**：`http://你的IP:8003/v1`
-- **API Key**：env 里 `DOULOR_API_KEY` 的值（自己随便设，proxy 只做本地校验）
-- **模型**：`workbuddy-deepseek-v4.1-flash`（免费）
-
-## 已踩过的坑（都有代码级注释）
-
-- **上游永远 SSE 流式**：即使 `"stream": false` 也返回 `data: {...}` 事件流，proxy 做了聚合转换
-- **响应 model 名归一化**：`workbuddy-deepseek-v4.1-flash` 上游返回 `deepseek-v4.1-flash`
-- **`__cflb` cookie 不需要**：Cloudflare LB 的，不带也能过
-- **chunked 大 payload**：上游只认 Content-Length 时，proxy 对 chunked 客户端做了兼容
-- **签到日界按 UTC+8**：不是服务器时区
-- **`auto groups is not enabled` 502**：站点会把你网关令牌的 group 同步成 `auto`，
-  而该分组未启用 → 全部 502。表象是"我账号被ban了？"实际账号/额度都正常。
-  **修复 = autofix.py 把 group 改回空**。网关对令牌信息有几分钟缓存，所以真实故障
-  最长「5 分钟定时器 + 缓存过期」才恢复，不是秒级。
-
-## 站点端备用
-
-网页实验室里模型选 **Site models 的 `paid-cn:*`** 一定 502（站方系统的 auto key），
-要用就选 **Free trial** 的 `deepseek-v4.1-flash` / `glm-5.3-flash`，或 **Free channels**。
-
-## 已验证（2026-10-23）
-
-- `install` → 服务 active，`/healthz` 200
-- 反代 `/v1/chat/completions` → 200（本地 + cloudflared 隧道公网均通）
-- 故意把令牌 group 设回 `auto` → 触发 autofix → 复核 `group=''` → 端到端 200
-- 签到：cookie 失效自动重登写回，streak 正常累加
