@@ -20,9 +20,12 @@
   GET  /healthz               健康检查
 """
 
+import http.client
 import json
 import os
 import re
+import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -39,9 +42,40 @@ CHAT_URL = f"{BASE}/api/lab/chat"
 IDENTIFIER = os.getenv("DOULOR_USER", "")
 PASSWORD = os.getenv("DOULOR_PASS", "")
 
+# ------------------------------------------------- 2026-10-25 账号池
+# 上游免费额度是按账号每天 1000 次（UTC 重置），单账号必然不够用。
+# 账号池文件 accounts.json（STATE_DIR 下，0600）：[{"user":..,"pass":..}, ...]
+# 面板 /api/panel/accounts 增删；env 的 DOULOR_USER/DOULOR_PASS 会作为
+# 首个账号自动并入（不写回文件，运行时合并）。
+# 轮换规则：
+#  - 平时固定用当前账号（避免会话抖动）
+#  - 429 且错误码 FREE_QUOTA_EXCEEDED → 该账号标记当日耗尽
+#    （按 UTC 日记，存 pool_state.json，次日自动解禁），立即换下一个重发
+#  - 401/403/502 等仍走原有重登/换模型/退避逻辑
+#  - 全部账号当日耗尽 → 429 回给客户端，附下次解禁时间
 STATE_DIR = os.getenv("DOULOR_STATE_DIR", "/opt/doulor-proxy")
 COOKIE_FILE = os.path.join(STATE_DIR, "session.json")
+
+# ------------------------------------------------- 2026-10-25 代理池
+# 防连坐封号：每个账号绑一个独立出口 IP，一个号被封不牵连其他号。
+# proxies.json（STATE_DIR，0600）：
+#   {"list": ["socks5://u:p@host:port", ...],           # 空闲未绑定
+#    "assigned": {"账号": "socks5://..."},               # 已绑定（绑一个消失一个）
+#    "failed": {"socks5://...": {"ts": .., "err": ..}}} # 连不通的代理记录
+# 规则：
+#   - 账号绑定了代理 → 该账号所有上游流量（登录/聊天/签到/模型列表）走它
+#   - 未绑定 → 直连
+#   - 绑定即从 list 移入 assigned，不回收复用（防坏出口连坐新号）
+#   - 删除账号时代理退回 list（误删可挽回；真烧了的出口在面板手动删）
+try:
+    import socks as _socks_mod          # PySocks，Debian: python3-socks
+except ImportError:
+    _socks_mod = None
+PROXIES_FILE = os.path.join(STATE_DIR, "proxies.json")
 LOG_FILE = os.path.join(STATE_DIR, "proxy.log")
+ACCOUNTS_FILE = os.path.join(STATE_DIR, "accounts.json")
+POOL_STATE_FILE = os.path.join(STATE_DIR, "pool_state.json")
+SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")   # 每账号一份 cookie
 
 LISTEN_HOST = os.getenv("DOULOR_LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.getenv("DOULOR_LISTEN_PORT", "8003"))
@@ -105,9 +139,13 @@ V1_KEY_FILE = os.path.join(STATE_DIR, "v1_token.json")   # {"key": "sk-..."}
 LAB_PROBE_INTERVAL = 600
 
 # 模型名映射：客户端/Hermes 仍用 workbuddy-* 名字；v1 通道用真名。
+# 2026-10-25 实测：v1 通道（api.doulor.cn，donation 分组）当前真实可用的名字。
+# 站点改过名：裸名 deepseek-v4.1-flash / hy3 已 503 model_not_found；
+# 实测 z-ai/glm-5.3-flash 200 稳定，deepseek-ai/deepseek-v4.1-flash 存在但易超时。
+# 映射不存在的名字会在上游 503 → 走 failover 换模型，不至于死。
 WORKBUDDY_TO_V1 = {
-    "workbuddy-deepseek-v4.1-flash": "deepseek-v4.1-flash",
-    "workbuddy-glm-5.3-flash": "glm-5.3-flash",
+    "workbuddy-deepseek-v4.1-flash": "deepseek-ai/deepseek-v4.1-flash",
+    "workbuddy-glm-5.3-flash": "z-ai/glm-5.3-flash",
     "workbuddy-hy3": "hy3",
     "workbuddy-hy4-preview-f": "hy4-preview-f",
     "workbuddy-space-bunny": "space-bunny",
@@ -129,21 +167,32 @@ _channel_lock = threading.Lock()
 
 
 def _probe_lab():
-    """静默探测 lab 通道是否恢复（一次小请求，失败不打扰日志）。"""
+    """静默探测 lab 通道是否恢复（号池任一账号可用即算可用）。
+
+    多账号后探测必须遍历号池：当前账号可能已 429，但新账号 lab 可用——
+    只盯一个账号会把整个 lab 通道误判为不可用，白白走 v1 扣额度。
+    """
     try:
-        sid = SESSION.get() if SESSION._sid else None
-        if not sid:
-            return False
-        h = _upstream_headers()
-        h["Cookie"] = f"doulor_session={sid}"
-        body = {"model": MODEL_ID, "messages": [{"role": "user", "content": "ping"}],
-                "stream": False, "max_tokens": 1}
-        req = urllib.request.Request(CHAT_URL, data=json.dumps(body).encode(),
-                                     method="POST", headers=h)
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return r.status == 200
+        sessions = list(POOL._sessions.values()) or [SESSION]
     except Exception:
-        return False
+        sessions = [SESSION]
+    for s in sessions:
+        try:
+            sid = s._sid or s.get()
+            if not sid:
+                continue
+            h = _upstream_headers()
+            h["Cookie"] = f"doulor_session={sid}"
+            body = {"model": MODEL_ID, "messages": [{"role": "user", "content": "ping"}],
+                    "stream": False, "max_tokens": 1}
+            req = urllib.request.Request(CHAT_URL, data=json.dumps(body).encode(),
+                                         method="POST", headers=h)
+            with open_url(req, proxy_for(getattr(s, "user", None)), timeout=20) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            continue
+    return False
 
 
 def current_channel():
@@ -168,7 +217,7 @@ def current_channel():
         return _channel["mode"]
 
 
-def upstream_chat(body, sid, timeout=180):
+def upstream_chat(body, sid, timeout=180, account_user=None):
     """打上游 chat，返回 (status, resp_headers, 原始流迭代器)。
 
     双通道：lab 模式走 cloud.doulor.cn cookie；v1 模式走 api.doulor.cn/v1
@@ -192,7 +241,7 @@ def upstream_chat(body, sid, timeout=180):
         h = _upstream_headers()
         h["Cookie"] = f"doulor_session={sid}"
         req = urllib.request.Request(CHAT_URL, data=data, method="POST", headers=h)
-    r = urllib.request.urlopen(req, timeout=timeout)
+    r = open_url(req, proxy_for(account_user), timeout=timeout)
     return r.status, r.headers, r
 MODELS_FALLBACK = [
     # 2026-10-23 实测全部可用的 workbuddy 模型（上游拉取失败时用）
@@ -326,19 +375,30 @@ def log(msg):
 # ---------------------------------------------------------------- 登录态
 
 class Session:
-    """管理上游登录 cookie：持久化、过期检测、403/401 自动重登。"""
+    """管理上游登录 cookie：持久化、过期检测、403/401 自动重登。
 
-    def __init__(self):
+    多账号模式：每个账号一个实例，cookie 存 sessions/<user>.json；
+    单账号兼容：user=None 时行为与旧版完全一致（session.json）。
+    """
+
+    def __init__(self, user=None, password=None, cookie_file=None):
+        self._user = user or IDENTIFIER
+        self._password = password or PASSWORD
+        self._cookie_file = cookie_file or COOKIE_FILE
         self._lock = threading.Lock()
         self._sid = None
         self._expires = 0
         self._last_auth_relogin = 0.0
         self.load()
 
+    @property
+    def user(self):
+        return self._user
+
     # --- 持久化 ---
     def load(self):
         try:
-            with open(COOKIE_FILE, encoding="utf-8") as f:
+            with open(self._cookie_file, encoding="utf-8") as f:
                 d = json.load(f)
             self._sid = d.get("session")
             self._expires = float(d.get("expires", 0))
@@ -352,21 +412,21 @@ class Session:
 
     def save(self):
         try:
-            os.makedirs(STATE_DIR, exist_ok=True)
-            tmp = COOKIE_FILE + ".tmp"
+            os.makedirs(os.path.dirname(self._cookie_file) or ".", exist_ok=True)
+            tmp = self._cookie_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"session": self._sid, "expires": self._expires,
-                           "saved_at": time.time()}, f)
-            os.replace(tmp, COOKIE_FILE)
-            os.chmod(COOKIE_FILE, 0o600)
+                           "saved_at": time.time(), "user": self._user}, f)
+            os.replace(tmp, self._cookie_file)
+            os.chmod(self._cookie_file, 0o600)
         except Exception as e:
             log(f"⚠️ cookie 保存失败: {e}")
 
     # --- 登录 ---
     def _login_raw(self):
         """真正打登录接口，返回 (sid, expires_ts) 或 (None, None)"""
-        body = json.dumps({"identifier": IDENTIFIER,
-                           "password": PASSWORD}).encode()
+        body = json.dumps({"identifier": self._user,
+                           "password": self._password}).encode()
         req = urllib.request.Request(
             LOGIN_URL, data=body, method="POST",
             headers={
@@ -381,11 +441,13 @@ class Session:
                 "User-Agent": UA,
             })
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            # 登录也走该账号绑定的出口：账号在哪个 IP 注册/首登，
+            # 后续就该一直在那个 IP 上，中途换 IP 极易触发风控。
+            with open_url(req, proxy_for(self._user), timeout=30) as r:
                 r.read()
                 raw = r.headers.get_all("Set-Cookie") or []
         except urllib.error.HTTPError as e:
-            log(f"❌ 登录失败 HTTP {e.code}")
+            log(f"❌ 登录失败 HTTP {e.code}（出口 {_mask_proxy(proxy_for(self._user)) if proxy_for(self._user) else '直连'}）")
             return None, None
         except Exception as e:
             log(f"❌ 登录异常: {type(e).__name__}: {e}")
@@ -403,10 +465,10 @@ class Session:
 
     def login(self, force=False):
         """拿到有效 session（带锁，避免并发重复登录）"""
-        if not IDENTIFIER or not PASSWORD:
-            log("❌ 没配置账号密码，请在 env 文件里设置 DOULOR_USER / DOULOR_PASS")
-            return None
         with self._lock:
+            if not self._user or not self._password:
+                log(f"❌ 账号 {self._user!r} 没配置密码，无法登录")
+                return None
             if not force and self._sid and self._expires - time.time() > 300:
                 return self._sid
             sid, exp = self._login_raw()
@@ -415,7 +477,7 @@ class Session:
             self._sid = sid
             self._expires = exp
             self.save()
-            log(f"✅ 登录成功，cookie 有效 {(exp - time.time()) / 86400:.1f} 天")
+            log(f"✅ 登录成功（{self._user}），cookie 有效 {(exp - time.time()) / 86400:.1f} 天")
             return sid
 
     def get(self):
@@ -455,11 +517,619 @@ class Session:
             self._sid = sid
             self._expires = exp
             self.save()
-            log(f"✅ 重登成功，cookie 有效 {(exp - time.time()) / 86400:.1f} 天")
+            log(f"✅ 重登成功（{self._user}），cookie 有效 {(exp - time.time()) / 86400:.1f} 天")
             return True
 
 
-SESSION = Session()
+SESSION = Session()          # 单账号兼容实例（同时是号池未启用时的全局会话）
+
+
+# ---------------------------------------------------------------- 代理池
+def _proxies_load():
+    """读 proxies.json，缺字段补默认值（损坏时返回空池，不炸服务）。"""
+    try:
+        with open(PROXIES_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            d.setdefault("list", [])
+            d.setdefault("assigned", {})
+            d.setdefault("failed", {})
+            d.setdefault("retired", {})   # 已解绑/删号的出口：永不自动复用，防连坐
+            return d
+    except Exception:
+        pass
+    return {"list": [], "assigned": {}, "failed": {}}
+
+
+def _proxies_save(d):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = PROXIES_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, PROXIES_FILE)
+        os.chmod(PROXIES_FILE, 0o600)
+        return True
+    except Exception as e:
+        log(f"⚠️ proxies.json 写入失败: {e}")
+        return False
+
+
+def proxy_for(user):
+    """账号 → 绑定的代理 URL；未绑定返回 None（直连）。"""
+    if not user:
+        return None
+    return _proxies_load()["assigned"].get(user)
+
+
+def _parse_proxy(url):
+    u = urllib.parse.urlparse(url)
+    scheme = (u.scheme or "socks5").lower()
+    if scheme not in ("socks5", "socks5h", "socks4", "http", "https"):
+        raise ValueError(f"不支持的代理协议: {scheme}")
+    return {
+        "scheme": scheme,
+        "host": u.hostname,
+        "port": u.port or (1080 if scheme.startswith("socks") else 8080),
+        "user": u.username or None,
+        "pass": urllib.parse.unquote(u.password) if u.password else None,
+        # socks5h / 带 h 的写法 = 让代理端做 DNS（本地不泄露域名）
+        "rdns": scheme == "socks5h",
+    }
+
+
+def _socks_connect_factory(cfg):
+    """返回一个 create_connection 兼容函数：每次调用建立一条走代理的 TCP 连接。
+
+    用 PySocks 的 socksocket 单条建连（set_proxy 只作用于这个 socket 实例），
+    不用 socks.set_default_proxy —— 那是进程级全局态，多账号并发时会把
+    A 号的流量从 B 号的出口发出去，隔离就白做了。
+    """
+    if not _socks_mod:
+        raise RuntimeError("socks 代理需要 PySocks（apt install python3-socks）")
+    ptmap = {"socks5": _socks_mod.PROXY_TYPE_SOCKS5,
+             "socks5h": _socks_mod.PROXY_TYPE_SOCKS5,
+             "socks4": _socks_mod.PROXY_TYPE_SOCKS4}
+
+    def connect(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+                source_address=None, **kw):
+        s = _socks_mod.socksocket(socket.AF_INET, socket.SOCK_STREAM)
+        s.set_proxy(ptmap[cfg["scheme"]], cfg["host"], cfg["port"],
+                    cfg["rdns"], cfg["user"], cfg["pass"])
+        if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT and timeout:
+            s.settimeout(timeout)
+        if source_address:
+            s.bind(source_address)
+        s.connect(address)
+        return s
+    return connect
+
+
+def _conn_class(base, proxy_url):
+    """派生 HTTP(S)Connection 子类，把建连动作换成走代理。
+
+    Python 3.13 的 http.client 把 _create_connection 放在**实例**属性上
+    （不是类属性），所以只能在 __init__ 里覆盖。子类化而不是 monkey-patch
+    全局，才能保证不同账号的请求各走各的出口、并发安全。
+    """
+    factory = _socks_connect_factory(_parse_proxy(proxy_url))
+
+    class _Proxied(base):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self._create_connection = factory
+    return _Proxied
+
+
+class _SocksHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, proxy_url):
+        super().__init__()
+        self._cls = _conn_class(http.client.HTTPConnection, proxy_url)
+
+    def http_open(self, req):
+        return self.do_open(self._cls, req)
+
+
+class _SocksHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, proxy_url):
+        super().__init__()
+        self._cls = _conn_class(http.client.HTTPSConnection, proxy_url)
+
+    def https_open(self, req):
+        return self.do_open(self._cls, req, context=self._context)
+
+
+def _build_opener(proxy_url):
+    """proxy_url=None → 直连 opener；其余 → 走该代理的 opener。"""
+    op = urllib.request.OpenerDirector()
+    # 必须显式给空 ProxyHandler：否则 urllib 会吃 http_proxy/https_proxy
+    # 环境变量，直连就不再是真直连。
+    op.add_handler(urllib.request.ProxyHandler({}))
+    if proxy_url:
+        cfg = _parse_proxy(proxy_url)
+        if cfg["scheme"] in ("http", "https"):
+            op.add_handler(urllib.request.ProxyHandler(
+                {"http": proxy_url, "https": proxy_url}))
+            op.add_handler(urllib.request.HTTPHandler())
+            op.add_handler(urllib.request.HTTPSHandler())
+        else:
+            op.add_handler(_SocksHTTPHandler(proxy_url))
+            op.add_handler(_SocksHTTPSHandler(proxy_url))
+    else:
+        op.add_handler(urllib.request.HTTPHandler())
+        op.add_handler(urllib.request.HTTPSHandler())
+    op.add_handler(urllib.request.HTTPDefaultErrorHandler())
+    op.add_handler(urllib.request.HTTPRedirectHandler())
+    op.add_handler(urllib.request.HTTPErrorProcessor())
+    return op
+
+
+_OPENER_CACHE = {}
+_OPENER_LOCK = threading.Lock()
+
+
+def get_opener(proxy_url):
+    """按代理 URL 缓存 opener（key 可为 None=直连）。"""
+    with _OPENER_LOCK:
+        if proxy_url not in _OPENER_CACHE:
+            _OPENER_CACHE[proxy_url] = _build_opener(proxy_url)
+        return _OPENER_CACHE[proxy_url]
+
+
+def opener_cache_clear(url=None):
+    with _OPENER_LOCK:
+        if url is None:
+            _OPENER_CACHE.clear()
+        else:
+            _OPENER_CACHE.pop(url, None)
+
+
+def open_url(req, proxy_url=None, timeout=30):
+    """所有上游请求的统一入口：按账号绑定的出口发出去。
+
+    proxy_url 为 None 走直连；失败不自动降级直连——那等于把该账号的
+    IP 暴露出来，绑定隔离就失效了，宁可这条请求报错。
+    """
+    return get_opener(proxy_url).open(req, timeout=timeout)
+
+
+def _mask_proxy(url):
+    """面板/日志展示：抹掉凭据，只留 scheme://host:port。"""
+    try:
+        u = urllib.parse.urlparse(url)
+        cred = f"{u.username}:***@" if u.username else ""
+        return f"{u.scheme}://{cred}{u.hostname}:{u.port or ''}"
+    except Exception:
+        return "<bad-proxy-url>"
+
+
+def _proxy_probe(url, timeout=15):
+    """探测出口可用：走它打一次 api.ipify.org，顺便拿到出口 IP 供面板显示。"""
+    try:
+        cfg = _parse_proxy(url)
+    except Exception as e:
+        return False, f"URL 格式错误: {e}", None
+    if cfg["scheme"].startswith("socks") and not _socks_mod:
+        return False, "缺少 PySocks（apt install python3-socks）", None
+    try:
+        req = urllib.request.Request("https://api.ipify.org?format=json",
+                                     headers={"User-Agent": UA})
+        with open_url(req, url, timeout=timeout) as r:
+            ip = json.loads(r.read().decode("utf-8", "replace")).get("ip")
+        return True, "OK", ip
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:120]}", None
+
+
+def _proxy_probe_upstream(url, timeout=15):
+    """再验一次上游能否到达（有些出口打不开 cloud.doulor.cn）。"""
+    try:
+        req = urllib.request.Request(BASE + "/api/lab/models", method="GET",
+                                     headers={"User-Agent": UA})
+        with open_url(req, url, timeout=timeout) as r:
+            return True, f"上游 HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        return e.code in (200, 401, 403), f"上游 HTTP {e.code}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:120]}"
+
+
+def proxy_pool_add(urls):
+    """批量加入口到空闲池（先探测，不通的进 failed 不入池）。"""
+    d = _proxies_load()
+    msgs, added = [], []
+    for raw in urls or []:
+        u = str(raw or "").strip()
+        if not u:
+            continue
+        if u in d["list"] or u in d["assigned"].values():
+            msgs.append(f"{_mask_proxy(u)}: 已在池中，跳过")
+            continue
+        ok, why, ip = _proxy_probe(u)
+        if not ok:
+            d["failed"][u] = {"ts": time.time(), "err": why}
+            msgs.append(f"{_mask_proxy(u)}: ❌ 不可用（{why}）")
+            continue
+        ok2, why2 = _proxy_probe_upstream(u)
+        if not ok2:
+            d["failed"][u] = {"ts": time.time(), "err": f"上游不可达 {why2}"}
+            msgs.append(f"{_mask_proxy(u)}: ❌ 打不开上游（{why2}）")
+            continue
+        d["failed"].pop(u, None)
+        d.setdefault("retired", {}).pop(u, None)   # 手动重加＝复活，离开退役池
+        d["list"].append(u)
+        added.append(u)
+        msgs.append(f"{_mask_proxy(u)}: ✅ 入池（出口 IP {ip}）")
+    if added:
+        _proxies_save(d)
+        log(f"➕ 代理池新增 {len(added)} 个出口，空闲 {len(d['list'])} 个")
+    return len(added), msgs
+
+
+def _resolve_proxy_url(url):
+    """把面板传来的（可能是脱敏的）地址解析回真实 URL。
+
+    面板列表里只出现 mask，所以删除按钮传回来的是 mask——
+    这里按 mask 反查唯一匹配项，避免把凭据暴露到浏览器。
+    """
+    url = str(url or "").strip()
+    d = _proxies_load()
+    cands = (list(d["list"]) + list(d["assigned"].values()) + list(d["failed"])
+             + [k for k in d.get("retired", {}) if not k.startswith("__")])
+    if url in cands:
+        return url
+    hits = {c for c in cands if _mask_proxy(c) == url}
+    return hits.pop() if len(hits) == 1 else None
+
+
+def proxy_pool_remove(url):
+    """彻底删除一个出口（空闲池/绑定中/failed 都清掉）。绑定中的账号回直连。"""
+    url = _resolve_proxy_url(url)
+    if not url:
+        return False, "没找到这个出口（或匹配到多个）"
+    d = _proxies_load()
+    hit = []
+    if url in d["list"]:
+        d["list"].remove(url)
+        hit.append("空闲池")
+    for acct, pu in list(d["assigned"].items()):
+        if pu == url:
+            del d["assigned"][acct]
+            hit.append(f"解绑 {acct}")
+    if url in d["failed"]:
+        del d["failed"][url]
+        hit.append("失败记录")
+    if url in d.get("retired", {}):
+        del d["retired"][url]
+        hit.append("退役池")
+    if not hit:
+        return False, "没找到这个出口"
+    _proxies_save(d)
+    opener_cache_clear(url)
+    log(f"➖ 删除出口 {_mask_proxy(url)}：{'，'.join(hit)}")
+    return True, "✅ 已删除（" + "，".join(hit) + "）"
+
+
+def proxy_assign(user, url=None):
+    """账号绑定出口。不传 url 时自动从空闲池取一个（绑一个消失一个）。
+
+    一个出口只服务一个账号：已绑给别人的拒绝；同账号重复绑会先解绑旧的。
+    """
+    user = str(user or "").strip()
+    if not user:
+        return False, "账号不能为空"
+    d = _proxies_load()
+    if url is None:
+        if not d["list"]:
+            return False, "空闲池没有出口了，先在下面添加代理"
+        url = d["list"].pop(0)
+        auto = True
+    else:
+        url = str(url).strip()
+        owner = next((a for a, p in d["assigned"].items() if p == url), None)
+        if owner and owner != user:
+            return False, f"这个出口已绑给 {owner}，一个出口只能绑一个账号"
+        if url in d["list"]:
+            d["list"].remove(url)
+        auto = False
+    old = d["assigned"].get(user)
+    if old and old != url and old not in d["list"] and \
+            old not in d["assigned"].values() and old != url:
+        d["list"].append(old)          # 旧出口退回空闲池
+    d["assigned"][user] = url
+    _proxies_save(d)
+    opener_cache_clear()
+    log(f"🔗 账号 {user} 绑定出口 {_mask_proxy(url)}"
+        + ("（自动分配）" if auto else "")
+        + (f"，旧出口 {_mask_proxy(old)} 退回空闲池" if old and old != url else ""))
+    return True, f"✅ 已绑定 {_mask_proxy(url)}"
+
+
+def proxy_unassign(user, retire=True):
+    """解绑。默认 retire=True：出口移入 retired 池，永不自动复用——防连坐封号。
+
+    想让一个 retired 出口"复活"再给新号用，必须在代理池面板用原地址
+    重新 add（从 retired 里摘出来），不能靠解绑自动回流。
+    """
+    d = _proxies_load()
+    user = str(user or "").strip()
+    url = d["assigned"].pop(user, None)
+    if not url:
+        return False, "该账号没有绑定出口"
+    if retire:
+        d["retired"].setdefault("__never_auto_reuse__", True)
+        d.setdefault("retired", {})
+        # 用 url 做 key 存，便于手动复活时识别
+        d["retired"][url] = d["retired"].get(url, 0) + 1
+    else:
+        if url not in d["list"] and url not in d["assigned"].values():
+            d["list"].append(url)
+    _proxies_save(d)
+    opener_cache_clear(url)
+    if retire:
+        log(f"🗑️ 账号 {user} 解绑出口 {_mask_proxy(url)} → retired（永不自动复用，防连坐）")
+        return True, "✅ 已解绑，出口已退役不回池（防连坐封号）"
+    log(f"🔓 账号 {user} 解绑出口 {_mask_proxy(url)}，退回空闲池")
+    return True, "✅ 已解绑，出口退回空闲池"
+
+
+def proxy_bindings_for(user):
+    """某账号当前绑定的出口（脱敏），给面板账号池那一行显示。"""
+    u = proxy_for(str(user or "").strip())
+    return _mask_proxy(u) if u else "直连"
+
+
+def proxy_pool_status():
+    """面板展示：空闲池 / 绑定关系 / 失败记录。凭据一律抹掉。"""
+    d = _proxies_load()
+    by_url = {}
+    for acct, pu in d["assigned"].items():
+        by_url.setdefault(pu, []).append(acct)
+    return {
+        # 只给 mask：代理地址里常带 user:pass，不能回传到浏览器
+        "free": [{"mask": _mask_proxy(url)} for url in d["list"]],
+        "assigned": [{"account": a, "mask": _mask_proxy(pu)}
+                     for pu, accts in by_url.items() for a in accts],
+        "failed": [{"mask": _mask_proxy(u), "err": v.get("err", ""),
+                    "at": v.get("ts")}
+                   for u, v in list(d["failed"].items())[-10:]],
+        # retired：解绑/删号后的出口，永不自动复用（防连坐封号）。
+        # 想再用必须面板手动重新粘贴地址 add（从 retired 摘出）。
+        "retired": [{"mask": _mask_proxy(u), "count": c}
+                    for u, c in d.get("retired", {}).items()
+                    if not u.startswith("__")],
+        "free_count": len(d["list"]),
+        "assigned_count": len(d["assigned"]),
+        "retired_count": len([k for k in d.get("retired", {}) if not k.startswith("__")]),
+        "socks_support": bool(_socks_mod),
+    }
+
+
+# ---------------------------------------------------------------- 账号池
+def _pool_load_accounts():
+    """读 accounts.json + env 单账号合并（env 账号排第一）。
+
+    返回 [{"user":..,"pass":..}, ...]；密码只留内存，列表给面板时会抹掉。
+    """
+    accounts = []
+    if os.path.isfile(ACCOUNTS_FILE):
+        try:
+            with open(ACCOUNTS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                for a in data:
+                    u = str((a or {}).get("user") or "").strip()
+                    p = str((a or {}).get("pass") or "").strip()
+                    if u and p:
+                        accounts.append({"user": u, "pass": p})
+        except Exception as e:
+            log(f"⚠️ accounts.json 读取失败: {e}")
+    if IDENTIFIER and PASSWORD:
+        # env 账号插到最前，保持旧行为优先级；去重
+        if not any(a["user"] == IDENTIFIER for a in accounts):
+            accounts.insert(0, {"user": IDENTIFIER, "pass": PASSWORD})
+    return accounts
+
+
+def _pool_save_accounts(accounts):
+    """accounts.json 原子写（不含 env 账号，env 账号每次运行时合并）。"""
+    pure = [a for a in accounts if a["user"] != IDENTIFIER]
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = ACCOUNTS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(pure, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, ACCOUNTS_FILE)
+        os.chmod(ACCOUNTS_FILE, 0o600)
+        return True
+    except Exception as e:
+        log(f"⚠️ accounts.json 写入失败: {e}")
+        return False
+
+
+def _utc_day(ts=None):
+    """免费额度按 UTC 日重置，日界键用 UTC 日期。"""
+    return time.strftime("%Y-%m-%d", time.gmtime(ts or time.time()))
+
+
+def _pool_next_reset():
+    """所有耗尽账号的最近 UTC 解禁时间（即下一个 UTC 0 点），本地时区展示。"""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    nxt = (now + _dt.timedelta(days=1)).replace(hour=0, minute=0,
+                                                second=0, microsecond=0)
+    # 加上本地时差给出本地时间的可读表达
+    return nxt.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+
+class AccountPool:
+    """多账号会话池 + 当日额度耗尽标记。
+
+    - current(): 返回当前可用 Session；全耗尽返回 None
+    - mark_exhausted(session): 429 FREE_QUOTA_EXCEEDED 时标记并切下一个
+    - add/remove: 面板增删账号（热生效，不重启）
+    - status(): 面板展示用
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._sessions = {}        # user -> Session
+        self._exhausted = {}       # user -> UTC 日键 "YYYY-MM-DD"
+        self._idx = 0
+        self.reload()
+
+    def reload(self):
+        """accounts.json 变更后重建会话映射（保留已有会话与耗尽标记）。"""
+        with self._lock:
+            accounts = _pool_load_accounts()
+            users = [a["user"] for a in accounts]
+            # 清掉已删除账号的残留
+            for u in list(self._sessions):
+                if u not in users:
+                    del self._sessions[u]
+            for a in accounts:
+                u = a["user"]
+                if u not in self._sessions:
+                    cf = COOKIE_FILE if u == IDENTIFIER else \
+                        os.path.join(SESSIONS_DIR, u + ".json")
+                    self._sessions[u] = Session(u, a["pass"], cf)
+            # 清理过期耗尽标记（非今日）
+            today = _utc_day()
+            for u in list(self._exhausted):
+                if self._exhausted[u] != today:
+                    del self._exhausted[u]
+            return len(users)
+
+    def mark_exhausted(self, session):
+        """标记该账号当日额度耗尽；返回切换后的新 Session 或 None。"""
+        with self._lock:
+            u = getattr(session, "user", None) or IDENTIFIER
+            self._exhausted[u] = _utc_day()
+            log(f"🚫 账号 {u} 今日免费额度已用完，切换下一个")
+            return self._pick()
+
+    def _pick(self):
+        """从 _idx 起找一个未耗尽的账号，返回其 Session；全耗尽返回 None。"""
+        users = list(self._sessions)
+        if not users:
+            return None
+        today = _utc_day()
+        n = len(users)
+        for off in range(n):
+            i = (self._idx + off) % n
+            u = users[i]
+            if self._exhausted.get(u) == today:
+                continue
+            self._idx = i
+            return self._sessions[u]
+        return None
+
+    def current(self):
+        """当前可用 Session；号池未启用/全耗尽时可能为 None。"""
+        with self._lock:
+            if not self._sessions:
+                return None
+            return self._pick()
+
+    def add(self, user, password):
+        with self._lock:
+            user, password = str(user or "").strip(), str(password or "").strip()
+            if not user or not password:
+                return False, "账号和密码都要填"
+            accounts = _pool_load_accounts()
+            if any(a["user"] == user for a in accounts):
+                return False, f"账号 {user} 已存在"
+            accounts.append({"user": user, "pass": password})
+            if not _pool_save_accounts(accounts):
+                return False, "写入 accounts.json 失败"
+            self.reload()
+            # 自动绑出口（绑一个消失一个）：空闲池有就分一个给新号。
+            # 新号从第一天起就固定用这个 IP 登录/聊天/签到，避免中途换 IP 风控。
+            proxy_note = ""
+            if proxy_for(user) is None:
+                pok, pmsg = proxy_assign(user)
+                if pok:
+                    proxy_note = "，已自动绑定出口 " + _mask_proxy(
+                        _proxies_load()["assigned"].get(user) or "")
+            # 预登录验证账号可用（不阻塞太久；失败也保留，等自然重试）
+            s = self._sessions.get(user)
+            sid = s.login() if s else None
+            log(f"➕ 面板添加账号 {user}: 登录{'成功' if sid else '失败（已保留，稍后自动重试）'}")
+            # 登录即签到：登录成功的当口就把第一次签到做掉，
+            # 不等当晚 cron——万一忘了配 cron，账号的积分一天都不落空。
+            ck_note = ""
+            if sid:
+                try:
+                    r = subprocess.run(
+                        [sys.executable, os.path.join(STATE_DIR, "checkin.py"),
+                         "--user", user],
+                        capture_output=True, text=True, timeout=120)
+                    tail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+                    for ln in tail:
+                        if user.split("@")[0] in ln and ("🎉" in ln or "✅" in ln):
+                            ck_note = "；" + ln.strip()
+                            break
+                    log(f"📝 新账号 {user} 登录即签到: exit={r.returncode}")
+                except Exception as e:
+                    log(f"⚠️ 新账号 {user} 登录即签到失败: {e}")
+            return True, ("✅ 已添加并登录成功" + proxy_note + ck_note if sid
+                          else "已添加，但登录失败（检查账号密码）" + proxy_note)
+
+    def remove(self, user):
+        with self._lock:
+            user = str(user or "").strip()
+            if user == IDENTIFIER:
+                return False, "该账号来自 env（DOULOR_USER），不能在面板删除"
+            accounts = _pool_load_accounts()
+            if not any(a["user"] == user for a in accounts):
+                return False, f"账号 {user} 不在号池里"
+            accounts = [a for a in accounts if a["user"] != user]
+            if not _pool_save_accounts(accounts):
+                return False, "写入 accounts.json 失败"
+            self._sessions.pop(user, None)
+            self._exhausted.pop(user, None)
+            # 出口跟着账号一起报废，不回空闲池：这个 IP 已经跟这个号绑死过，
+            # 再分给新号＝让新号继承旧号的风控痕迹，连坐封号。
+            if proxy_for(user):
+                ok_u, msg_u = proxy_unassign(user, retire=True)
+                if ok_u:
+                    log(f"   ↳ 出口已随账号报废（防连坐，账号 {user}）")
+            # 顺手清掉它的 cookie 文件
+            try:
+                cf = os.path.join(SESSIONS_DIR, user + ".json")
+                if os.path.isfile(cf):
+                    os.remove(cf)
+            except OSError:
+                pass
+            self.reload()
+            log(f"➖ 面板删除账号 {user}")
+            return True, "✅ 已删除"
+
+    def status(self):
+        """面板展示：不回传密码。"""
+        with self._lock:
+            today = _utc_day()
+            users = list(self._sessions)
+            cur_user = users[self._idx] if 0 <= self._idx < len(users) else None
+            out = []
+            for u, s in self._sessions.items():
+                out.append({
+                    "user": u,
+                    "exhausted": self._exhausted.get(u) == today,
+                    "exhaust_reset_utc": self._exhausted.get(u),
+                    "session": "valid" if s._sid else "none",
+                    "session_days": round(max(0, s._expires - time.time()) / 86400, 1),
+                    "current": u == cur_user,
+                    # 未绑定 = 直连（面板显示"直连"，避免以为没配就没隔离）
+                    "proxy": _mask_proxy(_pu) if (_pu := proxy_for(u)) else "直连",
+                    "proxied": bool(_pu),
+                })
+            return {"accounts": out, "utc_day": today,
+                    "all_exhausted": bool(self._sessions) and self._pick() is None,
+                    "proxy_pool": proxy_pool_status()}
+
+
+POOL = AccountPool()
 
 
 # ---------------------------------------------------------------- 上游调用
@@ -508,7 +1178,9 @@ def get_free_models(force=False):
             h["Cookie"] = f"doulor_session={sid}"
             h["Accept"] = "application/json"
             req = urllib.request.Request(MODELS_URL, headers=h)
-            with urllib.request.urlopen(req, timeout=20) as r:
+            _sess_models = POOL.current() or SESSION
+            with open_url(req, proxy_for(getattr(_sess_models, "user", None)),
+                          timeout=20) as r:
                 d = json.loads(r.read().decode("utf-8", "replace"))
             free = [str(m) for m in (d.get("freeModels") or [])]
             kept = [m for m in free if _model_allowed(m)]
@@ -863,14 +1535,16 @@ def handle_chat(handler, body):
         return False
 
     while True:
-        sid = SESSION.get()
+        _sess = POOL.current() or SESSION
+        sid = _sess.get()
         if not sid:
             json_response(handler, 502, {"error": {"message": "无法登录上游",
                                                  "type": "upstream_login_failed"}})
             return
 
         try:
-            status, hdrs, resp = upstream_chat(body, sid)
+            status, hdrs, resp = upstream_chat(
+                body, sid, account_user=getattr(_sess, "user", None))
         except urllib.error.HTTPError as e:
             code = e.code
             detail = e.read().decode("utf-8", "replace")[:500]
@@ -897,9 +1571,29 @@ def handle_chat(handler, body):
                 # 不要先 invalidate：清掉 sid 会让冷却期内的后续请求
                 # 走 get() 重新登录，等于绕过冷却。重登成功会覆盖 sid，
                 # 失败时留着旧 sid 让后续请求直接失败，不再打登录接口。
-                if SESSION.relogin_on_auth_error():
+                if _sess.relogin_on_auth_error():
                     continue
                 log(f"⏸ 重登被冷却/失败拦住，直接返回 {code}")
+
+            # 429 免费额度耗尽：换下一个账号立即重发，不退避等待。
+            # 配额按账号按天（UTC 重置）计，退避 2/5/10 秒毫无意义；
+            # 多账号轮换正是号池的意义。全部账号耗尽才把 429 回给客户端。
+            if code == 429 and "FREE_QUOTA_EXCEEDED" in detail:
+                nxt = POOL.mark_exhausted(_sess)
+                if nxt and nxt is not _sess:
+                    log(f"↪️ 切换账号 {_sess.user} → {nxt.user}，立即重发")
+                    auth_retried = False      # 新账号给一次重登机会
+                    continue
+                # 全部账号当日耗尽：算出最近解禁时间（UTC 0 点）
+                nxt_reset = _pool_next_reset()
+                json_response(handler, 429, {"error": {
+                    "message": f"所有账号今日免费额度已用完（1000 次/账号/天，"
+                               f"UTC 重置）。最早解禁: {nxt_reset}",
+                    "type": "free_quota_exceeded",
+                    "code": "ALL_ACCOUNTS_EXHAUSTED",
+                    "reset_utc": nxt_reset,
+                }})
+                return
 
             # 502 一律先试换模型（不限「渠道缺失」文案）：
             #   - 渠道缺失类：换模型常常 3s 内就通，原样重发是再等 10s；
@@ -1127,8 +1821,12 @@ PANEL_PASS_FILE = os.path.join(STATE_DIR, "panel_pass.json")
 
 
 def panel_pass_load():
-    """面板访问密码。优先 panel_pass.json，否则 env DOULOR_PANEL_PASS，
-    否则初始密码 admin123。"""
+    """面板访问密码。优先级：panel_pass.json → env DOULOR_PANEL_PASS →
+    首次启动随机生成并落盘。
+
+    绝不内置固定默认密码：面板能改出口/删账号，公开发布带死默认值等于没密码。
+    生成的密码只在首次启动日志里打一次，用户自己去看。
+    """
     try:
         with open(PANEL_PASS_FILE, encoding="utf-8") as f:
             d = json.load(f)
@@ -1136,7 +1834,19 @@ def panel_pass_load():
             return d["pass"]
     except Exception:
         pass
-    return os.getenv("DOULOR_PANEL_PASS", "admin123")
+    envp = os.getenv("DOULOR_PANEL_PASS")
+    if envp:
+        return envp
+    # 首次启动：随机生成 16 位，落盘 chmod 600，并在日志里提示一次
+    newp = "".join(secrets.choice("abcdefghijkmnpqrstuvwxyz23456789")
+                   for _ in range(16))
+    try:
+        panel_pass_set(newp)
+        log(f"🔑 面板初始密码已随机生成并写入 {PANEL_PASS_FILE}：{newp}")
+        log("   （只此一次，请自行保存；之后可在面板修改）")
+    except Exception as e:
+        log(f"⚠️ 面板密码落盘失败（{e}），回退到临时密码 {newp}")
+    return newp
 
 
 def panel_pass_set(newpass):
@@ -1282,6 +1992,24 @@ background:#1d3a50;color:#58a6ff;margin-left:8px}
 <span class="msg" id="ckmsg"></span></div>
 <div class="msg" style="color:#5b6478;margin-top:6px">此页只显示最近一次签到的结果（每天 cron 跑一次），不会自动向上游查询。</div></div>
 
+<div class="panel"><h2>账号池 <span class="tag" id="pooltag">加载中</span></h2>
+<div class="msg" style="margin-bottom:10px">429 免费额度耗尽时自动切下一个账号（1000 次/账号/天，UTC 重置）。env 里的账号固定排第一。</div>
+<table><thead><tr><th>账号</th><th>状态</th><th>会话</th><th>今日额度</th><th>出口 IP</th><th></th></tr></thead>
+<tbody id="pooltb"><tr><td colspan=6>加载中…</td></tr></tbody></table>
+<div class="row" style="margin-top:12px"><input id="pa_u" placeholder="账号(邮箱/用户名)">
+<input id="pa_p" type="password" placeholder="密码" style="max-width:180px">
+<button class="ok" onclick="poolAdd()">添加</button>
+<span class="msg" id="pam"></span></div>
+<div class="msg" style="color:#5b6478;margin-top:6px">添加即自动绑定一个空闲出口（绑一个消失一个）+ 立即签到一次；池子空了就直连。</div></div>
+
+<div class="panel"><h2>代理池 <span class="tag" id="pxtag">加载中</span></h2>
+<div class="msg" style="margin-bottom:10px">一个出口只绑一个账号，账号的登录/聊天/签到/模型列表全走它的出口 IP——封号不连坐。未绑定＝直连。</div>
+<table><thead><tr><th>出口</th><th>归属</th><th></th></tr></thead>
+<tbody id="pxtb"><tr><td colspan=3>加载中…</td></tr></tbody></table>
+<div class="row" style="margin-top:12px"><input id="px_in" placeholder="socks5://user:pass@host:port  或  http://host:port（可空格/换行批量）">
+<button class="ok" onclick="proxyAdd()">添加并探测</button></div>
+<div class="msg" id="pxmsg"></div></div>
+
 <div class="panel"><h2>doulor 账号 <span class="tag">保存后自动重新登录</span></h2>
 <div class="row"><input id="duser" placeholder="账号(邮箱/用户名)">
 <input id="dpass" type="password" placeholder="密码"></div>
@@ -1328,6 +2056,8 @@ async function boot(force){
     .map(([m,d])=>`<tr><td class="mono">${esc(m)}</td><td>${d.requests}</td><td>${fmt(d.total)}</td><td>${d.errors||0}</td></tr>`).join(''))||'<tr><td colspan=4>暂无</td></tr>';
   const days=Object.entries(s.days||{}).sort().slice(-14);
   $('days').innerHTML=days.map(([d,v])=>`<tr><td>${d}</td><td>${v.requests}</td><td>${fmt(v.total)}</td><td>${v.errors||0}</td></tr>`).join('')||'<tr><td colspan=4>暂无</td></tr>';
+  // 账号池
+  renderPool(st.pool);
   // cron 自动签到状态（纯本地读 checkin.log，不走上游）
   const ck=st.cron_checkin||{};
   if(ck.last){
@@ -1343,6 +2073,95 @@ async function boot(force){
   api('/api/panel/logs').then(r=>r.text()).then(t=>{
     const el=$('lg');const atBottom=el.scrollTop+el.clientHeight>=el.scrollHeight-30;
     el.textContent=t||'(空)';if(atBottom)el.scrollTop=el.scrollHeight;});
+}
+function renderPool(pool){
+  if(!pool){$('pooltag').textContent='未启用';return}
+  const all=pool.all_exhausted;
+  $('pooltag').textContent=all?'全部额度耗尽':(pool.accounts.length+' 个账号');
+  $('pooltag').style.color=all?'#f87171':'';
+  $('pooltb').innerHTML=(pool.accounts||[]).map(a=>
+    `<tr><td class="mono">${esc(a.user)}</td>
+     <td>${a.current?'<b style="color:#4ec9b0">使用中</b>':'备用'}</td>
+     <td>${a.session==='valid'?esc(a.session_days)+' 天':'无'}</td>
+     <td>${a.exhausted?'<span class="err">耗尽（UTC 日重置）</span>':'<span class="okc">可用</span>'}</td>
+     <td class="mono">${a.proxied?esc(a.proxy):'<span class="dim">直连</span>'}</td>
+     <td>${a.proxied
+        ?`<button onclick="proxyUnassign('${esc(a.user)}')">解绑</button>`
+        :`<button onclick="proxyAssign('${esc(a.user)}')">绑出口</button>`}
+        <button onclick="poolDel('${esc(a.user)}')">删除</button></td></tr>`).join('')
+    ||'<tr><td colspan=6>暂无账号（用下方添加）</td></tr>';
+  renderProxies(pool.proxy_pool);
+}
+function renderProxies(pp){
+  if(!pp)return;
+  $('pxtag').textContent=`空闲 ${pp.free_count||0} · 已绑 ${pp.assigned_count||0} · 退役 ${pp.retired_count||0}`;
+  const free=(pp.free||[]).map(f=>
+    `<tr><td class="mono">${esc(f.mask)}</td><td><span class="okc">空闲</span></td>
+     <td><button onclick="proxyRemove('${esc(f.mask)}')">删除</button></td></tr>`).join('');
+  const asg=(pp.assigned||[]).map(f=>
+    `<tr><td class="mono">${esc(f.mask)}</td>
+     <td><span class="okc">→ ${esc(f.account)}</span></td>
+     <td><button onclick="proxyUnassign('${esc(f.account)}')">解绑</button></td></tr>`).join('');
+  const bad=(pp.failed||[]).map(f=>
+    `<tr><td class="mono"><span class="err">${esc(f.mask)}</span></td>
+     <td colspan=2 class="dim">${esc(f.err||'')}</td></tr>`).join('');
+  const ret=(pp.retired||[]).map(f=>
+    `<tr><td class="mono dim">${esc(f.mask)}</td>
+     <td colspan=2 class="dim">🗑️ 退役（不自动复用·防连坐）· 想复用就重新粘贴地址添加</td></tr>`).join('');
+  $('pxtb').innerHTML=(asg+free+ret+bad)||'<tr><td colspan=3 class="dim">池子是空的，把代理地址粘到上面添加</td></tr>';
+  if(!pp.socks_support)$('pxmsg').textContent='⚠️ 未装 PySocks，socks5 代理不可用（apt install python3-socks）';
+}
+async function proxyAdd(){
+  const raw=$('px_in').value.trim();
+  if(!raw){$('pxmsg').textContent='先填代理地址';return}
+  $('pxmsg').textContent='逐个探测中（走代理打一次上游）…';$('pxmsg').className='msg';
+  const r=await api('/api/panel/proxies',{method:'POST',
+    body:JSON.stringify({action:'add',urls:raw})});
+  const d=await r.json().catch(()=>({}));
+  $('pxmsg').innerHTML=esc((d.messages||[]).join('\n')).replace(/\n/g,'<br>');
+  $('pxmsg').className='msg '+(d.ok?'okc':'err');
+  if(d.ok)$('px_in').value='';boot(true);
+}
+async function proxyAssign(user){
+  const r=await api('/api/panel/proxies',{method:'POST',
+    body:JSON.stringify({action:'assign',user:user})});
+  const d=await r.json().catch(()=>({}));
+  if(!d.ok)alert(d.message||'绑定失败');
+  boot(true);
+}
+async function proxyUnassign(user){
+  const r=await api('/api/panel/proxies',{method:'POST',
+    body:JSON.stringify({action:'unassign',user:user})});
+  const d=await r.json().catch(()=>({}));
+  if(!d.ok)alert(d.message||'解绑失败');
+  boot(true);
+}
+async function proxyRemove(mask){
+  // 面板只显示脱敏地址，真值由后端按 mask 反查：这里传 mask，后端负责匹配
+  if(!confirm('删除出口 '+mask+'？（绑着的账号会回直连）'))return;
+  const r=await api('/api/panel/proxies',{method:'POST',
+    body:JSON.stringify({action:'remove',url:mask})});
+  const d=await r.json().catch(()=>({}));
+  if(!d.ok)alert(d.message||'删除失败');
+  boot(true);
+}
+async function poolAdd(){
+  const u=$('pa_u').value.trim(),p=$('pa_p').value;
+  if(!u||!p){$('pam').textContent='账号密码都要填';return}
+  $('pam').textContent='添加中（含登录验证）…';
+  const r=await api('/api/panel/accounts',{method:'POST',
+    body:JSON.stringify({action:'add',user:u,pass:p})});
+  const d=await r.json().catch(()=>({}));
+  $('pam').textContent=d.message||'';$('pam').className='msg '+(d.ok?'okc':'err');
+  if(d.ok){$('pa_u').value='';$('pa_p').value='';boot(true);}
+}
+async function poolDel(u){
+  if(!confirm('删除账号 '+u+'？'))return;
+  const r=await api('/api/panel/accounts',{method:'POST',
+    body:JSON.stringify({action:'remove',user:u})});
+  const d=await r.json().catch(()=>({}));
+  if(!d.ok)alert(d.message||'删除失败');
+  boot(true);
 }
 async function loadResult(){
   // 只读本地 checkin_result.json，绝不查询上游
@@ -1454,6 +2273,8 @@ class Handler(__import__("http.server", fromlist=["BaseHTTPRequestHandler"]).Bas
                 "session_days": round(max(0, SESSION._expires - time.time()) / 86400, 1),
                 "cred_user": IDENTIFIER,
                 "cron_checkin": _checkin_cron_status(),
+                "pool": POOL.status(),
+                "proxies": proxy_pool_status(),
             })
             return
         if p == "/api/panel/points":
@@ -1500,6 +2321,62 @@ class Handler(__import__("http.server", fromlist=["BaseHTTPRequestHandler"]).Bas
             if p == "/api/panel/points":
                 ok, d = _panel_points()
                 json_response(self, 200 if ok else 502, d)
+                return
+            if p == "/api/panel/accounts":
+                act = str(body.get("action") or "")
+                if act == "list":
+                    json_response(self, 200, {"ok": True, **POOL.status()})
+                elif act == "add":
+                    ok, msg = POOL.add(body.get("user"), body.get("pass"))
+                    json_response(self, 200 if ok else 400,
+                                  {"ok": ok, "message": msg})
+                elif act == "remove":
+                    ok, msg = POOL.remove(body.get("user"))
+                    json_response(self, 200 if ok else 400,
+                                  {"ok": ok, "message": msg})
+                else:
+                    json_response(self, 400, {"ok": False,
+                                              "message": "action 要是 list/add/remove"})
+                return
+            if p == "/api/panel/proxies":
+                act = str(body.get("action") or "")
+                if act == "list":
+                    json_response(self, 200, {"ok": True, **proxy_pool_status()})
+                elif act == "add":
+                    raw = body.get("urls")
+                    if isinstance(raw, str):
+                        urls = [x for x in re.split(r"[\s,]+", raw) if x.strip()]
+                    else:
+                        urls = list(raw or body.get("url") and [body.get("url")] or [])
+                    if not urls:
+                        json_response(self, 400, {"ok": False, "message": "要填代理地址"})
+                        return
+                    n, msgs = proxy_pool_add(urls)
+                    json_response(self, 200 if n else 400,
+                                  {"ok": bool(n), "added": n, "messages": msgs,
+                                   **proxy_pool_status()})
+                elif act == "remove":
+                    ok, msg = proxy_pool_remove(str(body.get("url") or "").strip())
+                    json_response(self, 200 if ok else 400,
+                                  {"ok": ok, "message": msg, **proxy_pool_status()})
+                elif act == "assign":
+                    # user 不传 url：自动从空闲池取一个（绑一个消失一个）
+                    ok, msg = proxy_assign(body.get("user"), body.get("url") or None)
+                    json_response(self, 200 if ok else 400,
+                                  {"ok": ok, "message": msg, **proxy_pool_status()})
+                elif act == "unassign":
+                    ok, msg = proxy_unassign(body.get("user"))
+                    json_response(self, 200 if ok else 400,
+                                  {"ok": ok, "message": msg, **proxy_pool_status()})
+                elif act == "probe":
+                    url = str(body.get("url") or "").strip()
+                    ok1, why1, ip = _proxy_probe(url)
+                    ok2, why2 = _proxy_probe_upstream(url) if ok1 else (False, "-")
+                    json_response(self, 200, {"ok": ok1 and ok2, "ip": ip,
+                                              "probe": why1, "upstream": why2})
+                else:
+                    json_response(self, 400, {"ok": False,
+                                              "message": "action 要是 list/add/remove/assign/unassign/probe"})
                 return
             if p == "/api/panel/creds":
                 global IDENTIFIER, PASSWORD
@@ -1578,6 +2455,10 @@ def main():
     log(f"   监听: {LISTEN_HOST}:{LISTEN_PORT}")
     log(f"   状态目录: {STATE_DIR}")
     log("=" * 50)
+
+    # 启动即确保面板密码就位（首次启动会随机生成并在日志里提示一次），
+    # 否则用户装完不知道该用什么密码登录面板。
+    panel_pass_load()
 
     if not SESSION.get():
         log("⚠️ 首次登录失败，稍后重试")

@@ -55,6 +55,17 @@ EOF
     systemctl daemon-reload
 }
 
+# 安全写入 env：转义 sed 替换串里的特殊字符，避免密码含 | & / \ 时写坏文件
+set_env() {
+    _k=$1; _v=$2
+    _esc=$(printf '%s' "$_v" | sed -e 's/[\\|&]/\\&/g')
+    if grep -q "^$_k=" "$ENV_FILE"; then
+        sed -i "s|^$_k=.*|$_k=$_esc|" "$ENV_FILE"
+    else
+        printf '%s=%s\n' "$_k" "$_v" >> "$ENV_FILE"
+    fi
+}
+
 sync() { mk_env; install_unit; }
 
 case "$1" in
@@ -62,26 +73,32 @@ case "$1" in
       sync
       if ! grep -q '^DOULOR_USER=..' "$ENV_FILE"; then
           printf "账号 (identifier): "; read -r u
-          printf "密码: "; read -r p
-          sed -i "s|^DOULOR_USER=.*|DOULOR_USER=$u|" "$ENV_FILE"
-          sed -i "s|^DOULOR_PASS=.*|DOULOR_PASS=$p|" "$ENV_FILE"
+          printf "密码（输入不回显）: "; read -rs p; echo
+          set_env DOULOR_USER "$u"
+          set_env DOULOR_PASS "$p"
+          unset u p
       fi
       cp -f "$HERE/proxy.py" "$DIR/proxy.py" 2>/dev/null || true
       cp -f "$HERE/checkin.py" "$DIR/checkin.py" 2>/dev/null || true
       cp -f "$HERE/autofix.py" "$DIR/autofix.py" 2>/dev/null || true
       cp -f "$HERE/d.sh" "$DIR/d.sh" 2>/dev/null || true
       chmod +x "$DIR/d.sh" 2>/dev/null || true
-      # 每日自动签到 cron
+      # 每日自动签到 cron（日界按 UTC+8，主机若是 UTC 会自动换算）
       if [ -f "$HERE/doulor-checkin.cron" ]; then
           sed "s|__DIR__|$DIR|g" "$HERE/doulor-checkin.cron" > /etc/cron.d/doulor-checkin
           chmod 644 /etc/cron.d/doulor-checkin
+      fi
+      # 令牌分组自愈定时器（修 auto groups 502），路径按 $DIR 渲染
+      if [ -f "$HERE/doulor-token-autofix.service" ] && [ -f "$HERE/doulor-token-autofix.timer" ]; then
+          sed "s|__DIR__|$DIR|g" "$HERE/doulor-token-autofix.service" > /etc/systemd/system/doulor-token-autofix.service
+          cp -f "$HERE/doulor-token-autofix.timer" /etc/systemd/system/doulor-token-autofix.timer
+          systemctl daemon-reload
+          systemctl enable --now doulor-token-autofix.timer >/dev/null 2>&1 || true
       fi
       systemctl enable $SVC >/dev/null 2>&1
       systemctl restart $SVC
       sleep 3
       echo "✅ 安装完成"
-      echo "   API:  http://127.0.0.1:$PORT/v1"
-      echo "   面板: http://127.0.0.1:$PORT/  (初始密码 admin123)"
       "$HERE/d.sh" status
       ;;
   start)   sync; systemctl enable $SVC >/dev/null 2>&1; systemctl restart $SVC; echo "✅ 已启动" ;;
@@ -93,16 +110,21 @@ case "$1" in
       echo ;;
   key)
       sync
-      [ -n "$2" ] || { echo "用法: $0 key <你的key>"; exit 1; }
-      sed -i "s|^DOULOR_API_KEY=.*|DOULOR_API_KEY=$2|" "$ENV_FILE"
+      if [ -n "$2" ]; then K=$2; else
+          printf "API Key（输入不回显，留空则随机生成）: "; read -rs K; echo
+          [ -n "$K" ] || K=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | cut -c1-32)
+      fi
+      set_env DOULOR_API_KEY "$K"
+      unset K
       systemctl restart $SVC
       echo "✅ API key 已设置并重启" ;;
   pass)
       sync
       printf "账号 (identifier): "; read -r u
-      printf "密码: "; read -r p
-      sed -i "s|^DOULOR_USER=.*|DOULOR_USER=$u|" "$ENV_FILE"
-      sed -i "s|^DOULOR_PASS=.*|DOULOR_PASS=$p|" "$ENV_FILE"
+      printf "密码（输入不回显）: "; read -rs p; echo
+      set_env DOULOR_USER "$u"
+      set_env DOULOR_PASS "$p"
+      unset u p
       systemctl restart $SVC
       echo "✅ 账号密码已更新" ;;
   test)
@@ -118,6 +140,9 @@ case "$1" in
       systemctl stop $SVC 2>/dev/null || true
       systemctl disable $SVC 2>/dev/null || true
       rm -f /etc/systemd/system/$SVC.service
+      rm -f /etc/systemd/system/doulor-token-autofix.service
+      rm -f /etc/systemd/system/doulor-token-autofix.timer
+      systemctl disable --now doulor-token-autofix.timer >/dev/null 2>&1 || true
       rm -f /etc/cron.d/doulor-checkin
       systemctl daemon-reload
       echo "✅ 已卸载（env 和 cookie 保留在 $DIR）" ;;

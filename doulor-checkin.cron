@@ -1,5 +1,5 @@
-# doulor.cloud 每日自动签到（UTC+8 日界，每天 00:10）
-# 路径按实际安装目录调整；由 d.sh install 自动安装
+# doulor.cloud 每日自动签到（上游日界按 UTC+8，每天 00:10 触发）
+# 由 d.sh install 自动安装到 /etc/cron.d/，__DIR__ 会替换成实际安装目录
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 10 0 * * * root /usr/bin/python3 __DIR__/checkin.py >/dev/null 2>&1

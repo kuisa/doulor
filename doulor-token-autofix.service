@@ -5,5 +5,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/opt/doulor-proxy
-ExecStart=/usr/bin/python3 /opt/doulor-proxy/autofix.py
+WorkingDirectory=__DIR__
+EnvironmentFile=-__DIR__/env
+ExecStart=/usr/bin/python3 __DIR__/autofix.py
