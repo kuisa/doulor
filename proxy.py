@@ -58,6 +58,17 @@ AUTH_RELOGIN_COOLDOWN = 30
 # "可用渠道不存在" 更是常态。这类不该让客户端一次失败就断掉。
 RETRY_BACKOFF = (2, 5, 10)       # 每次重试前等待的秒数
 
+# 渠道缺失时换模型，而不是重发同一个。
+# 上游报「分组 auto 下模型 X 的可用渠道不存在」/「Failed to get available
+# channel for model X」时，说明该模型此刻没有健康渠道：这条错误自己就要
+# 等约 10 秒才返回，原样重发大概率再等 10 秒拿同样的 502。
+# 换成同池另一个模型立刻重发，可以把 20 秒压到 3 秒左右。
+# 只有这类「渠道缺失」才切换；普通 5xx/429 仍按 RETRY_BACKOFF 原样重试
+# （那是上游整体抖动，换模型也一样）。
+FAILOVER_MODELS = ("workbuddy-glm-5.3-flash", "workbuddy-hy3",
+                   "workbuddy-deepseek-v4.1-flash")
+FAILOVER_MAX = int(os.getenv("DOULOR_FAILOVER_MAX", "2"))
+
 # 上游硬限制：单次请求 role=="tool" 的消息条数上限 29（30 条起返回
 # 400 INVALID_MESSAGES，文案却写"至少需要一条用户消息"，极具误导性）。
 # 实测 62 条消息的阈值本质就是 tool 条数，纯 user/assistant 对话可到 150+
@@ -654,6 +665,37 @@ def json_response(handler, code, obj, extra_headers=None):
     handler.wfile.write(data)
 
 
+def _is_channel_missing(detail):
+    """上游 502 是否属于「该模型此刻没有可用渠道」。
+
+    两种文案（中文站点 + 英文 new-api 兜底）：
+      分组 auto 下模型 X 的可用渠道不存在（retry）
+      Failed to get available channel for model X
+    这类错误是**按模型**的：换个模型往往立刻可用，原样重发只是再等
+    一个 10 秒超时。跟 5xx 整体抖动要分开处理。
+
+    上游把中文写成 \\uXXXX 转义，所以先按 JSON 解一层再匹配，
+    否则中文关键词永远匹配不到。
+    """
+    texts = [detail or ""]
+    try:
+        obj = json.loads(detail)
+        if isinstance(obj, dict):
+            e = obj.get("error")
+            if isinstance(e, str):
+                texts.append(e)
+            elif isinstance(e, dict):
+                texts.append(json.dumps(e, ensure_ascii=False))
+    except Exception:
+        pass
+    for t in texts:
+        low = t.lower()
+        if ("可用渠道不存在" in low or "available channel" in low
+                or "no channel" in low):
+            return True
+    return False
+
+
 def _is_retryable_code(code):
     """上游哪些状态码值得重发。
 
@@ -784,6 +826,8 @@ def handle_chat(handler, body):
 
     retries = 0          # 故障重试已用次数
     auth_retried = False  # 鉴权重试只给一次，和故障重试分开计
+    failovers = 0         # 换模型重发已用次数
+    tried_models = {_model}   # 已失败的模型，避免来回换同一个
 
     def backoff(reason):
         """按剩余额度退避等待；返回 True 表示调用方可以 continue 重试。
@@ -796,6 +840,27 @@ def handle_chat(handler, body):
         log(f"🔁 {wait}s 后重试（{retries}/{len(RETRY_BACKOFF)}），原因 {reason}")
         time.sleep(wait)
         return True
+
+    def failover():
+        """换一个同池模型立刻重发（不 sleep）。返回 True 表示可以 continue。
+
+        只用于「该模型无可用渠道」这类按模型的 502：那条错误自己就要等
+        约 10 秒才返回，原样重发大概率再等 10 秒拿同样的 502，换模型常常
+        3 秒内就通。响应里的 model 字段会如实反映实际生效的模型。
+        """
+        nonlocal failovers
+        if failovers >= FAILOVER_MAX:
+            return False
+        for alt in FAILOVER_MODELS:
+            if alt in tried_models:
+                continue
+            failovers += 1
+            tried_models.add(alt)
+            log(f"↪️ 渠道缺失，换模型重发: {body.get('model')} → {alt}"
+                f"（{failovers}/{FAILOVER_MAX}）")
+            body["model"] = alt
+            return True
+        return False
 
     while True:
         sid = SESSION.get()
@@ -836,11 +901,21 @@ def handle_chat(handler, body):
                     continue
                 log(f"⏸ 重登被冷却/失败拦住，直接返回 {code}")
 
+            # 502 一律先试换模型（不限「渠道缺失」文案）：
+            #   - 渠道缺失类：换模型常常 3s 内就通，原样重发是再等 10s；
+            #   - 兜底文案「AI 调用失败（HTTP 502）」：分不清是渠道还是
+            #     过载，但换模型重发不 sleep，失败后照旧落到下面的退避
+            #     分支，最坏情况只是多试了一个模型，不会更差。
+            # 非 502 的可重试错误（429/5xx 其他码）仍直接走退避原样重发。
+            if code == 502 and failover():
+                tag = "渠道缺失" if _is_channel_missing(detail) else "其他502"
+                log(f"ℹ️ {tag}: {detail[:120]}")
+                continue
+
             # 间歇性故障：退避后重发同一个 body。此时还没给客户端写过
             # 任何字节（流式也一样），所以重试是安全的。
             if _is_retryable_code(code) and backoff(code):
                 continue
-
             json_response(handler, code, {"error": _normalize_error(detail)})
             return
         except Exception as e:
@@ -917,7 +992,7 @@ def handle_chat(handler, body):
 
             def finish_chunk(reason):
                 return {"id": chunk_id, "object": "chat.completion.chunk",
-                        "created": created, "model": body.get("model"),
+                        "created": created, "model": _model,
                         "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]}
 
             st = {}
@@ -942,7 +1017,7 @@ def handle_chat(handler, body):
                         if any(c.get("finish_reason") for c in choices):
                             st["finish"] = True
                         emit({"id": chunk_id, "object": "chat.completion.chunk",
-                              "created": created, "model": body.get("model"),
+                              "created": created, "model": _model,
                               "choices": choices})
                         if client_gone:
                             break
@@ -989,7 +1064,7 @@ def handle_chat(handler, body):
                 # 客户端明确要 include_usage 才补这一块：OpenAI 规范里
                 # usage 只在这种时候出现，无条件发会让严格客户端报错。
                 emit({"id": chunk_id, "object": "chat.completion.chunk",
-                      "created": created, "model": body.get("model"),
+                      "created": created, "model": _model,
                       "choices": [], "usage": got_usage})
 
             if not client_gone:
@@ -1028,7 +1103,7 @@ def handle_chat(handler, body):
             "id": chunks[0].get("id", "chatcmpl-proxy") if chunks else "chatcmpl-proxy",
             "object": "chat.completion",
             "created": chunks[0].get("created", int(time.time())) if chunks else int(time.time()),
-            "model": body.get("model"),
+            "model": _model,
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": text},
